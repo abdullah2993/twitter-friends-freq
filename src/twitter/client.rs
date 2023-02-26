@@ -1,12 +1,18 @@
 use std::{
+    cell::RefMut,
     fmt::Display,
     io,
-    time::{SystemTime, UNIX_EPOCH},
+    ops::Add,
+    rc::Rc,
+    sync::Arc,
+    thread::{self},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use crypto::{hmac::Hmac, mac::Mac, sha1::Sha1};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use ureq::Request;
 
 use super::utils::{encode, encode_b64};
 
@@ -23,7 +29,6 @@ fn stringify(values: URLValues) -> String {
         .join("&")
 }
 
-// #[derive(Clone)]
 pub struct Client {
     access_token: String,
     access_token_secret: String,
@@ -43,6 +48,54 @@ pub enum TwitterApiError {
     IOError(#[from] io::Error),
 }
 
+struct RateLimit {
+    total: u64,
+    remaining: u64,
+    reset_at: SystemTime,
+}
+
+impl TryFrom<ureq::Response> for RateLimit {
+    type Error = &'static str;
+
+    fn try_from(response: ureq::Response) -> Result<Self, Self::Error> {
+        let total = response
+            .header("x-rate-limit-limit")
+            .ok_or("Missing total rate limit header")?
+            .parse()
+            .map_err(|_| "Failed to parse total rate limit header")?;
+
+        let remaining = response
+            .header("x-rate-limit-remaining")
+            .ok_or("Missing remaining rate limit header")?
+            .parse()
+            .map_err(|_| "Failed to parse remaining rate limit header")?;
+
+        let reset_epoch = response
+            .header("x-rate-limit-reset")
+            .ok_or("Missing reset rate limit header")?
+            .parse::<u64>()
+            .map_err(|_| "Failed to parse reset rate limit header")?;
+
+        let reset_at = UNIX_EPOCH + std::time::Duration::from_secs(reset_epoch);
+
+        Ok(Self {
+            total,
+            remaining,
+            reset_at,
+        })
+    }
+}
+
+impl RateLimit {
+    fn is_rate_limit_error(err: &ureq::Error) -> bool {
+        match *err {
+            ureq::Error::Status(code, _) => code == 429,
+            _ => false,
+        }
+    }
+}
+
+#[derive(Clone)]
 enum RelationType {
     Followers,
     Friends,
@@ -57,18 +110,84 @@ impl Display for RelationType {
     }
 }
 
+#[derive(Clone)]
 enum ScreenNameOrUserId {
-    ScreenName,
-    UserId,
+    ScreenName(String),
+    UserId(String),
 }
 
 impl Display for ScreenNameOrUserId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::ScreenName => write!(f, "screen_name"),
-            Self::UserId => write!(f, "user_id"),
+            Self::ScreenName(_) => write!(f, "screen_name"),
+            Self::UserId(_) => write!(f, "user_id"),
         }
     }
+}
+
+impl Into<(String, String)> for ScreenNameOrUserId {
+    fn into(self) -> (String, String) {
+        return (self.to_string(), self.value());
+    }
+}
+
+pub struct ResponseIter {
+    client: Client,
+    cursor: String,
+    by: ScreenNameOrUserId,
+    rel: RelationType,
+    wait_rate_limit: bool,
+}
+
+impl<'a> Iterator for ResponseIter {
+    type Item = Response;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let res = self.client.get_follower_or_friends(
+            self.rel.clone(),
+            self.by.clone(),
+            Some(self.cursor.clone()),
+        );
+
+        return match res {
+            Ok(res) => {
+                self.cursor = res.next_cursor_str.clone();
+                return Some(res);
+            }
+            Err(TwitterApiError::RequestError(err))
+                if self.wait_rate_limit && RateLimit::is_rate_limit_error(&err) =>
+            {
+                let res = err.into_response().unwrap();
+                let rate_limit = RateLimit::try_from(res).unwrap();
+
+                thread::sleep(
+                    rate_limit
+                        .reset_at
+                        .duration_since(SystemTime::now())
+                        .unwrap()
+                        .add(Duration::from_secs(60)),
+                );
+                return self.next();
+            }
+            _ => None,
+        };
+    }
+}
+
+impl ScreenNameOrUserId {
+    fn value(&self) -> String {
+        match self {
+            Self::ScreenName(screen_name) => screen_name.clone(),
+            Self::UserId(user_id) => user_id.clone(),
+        }
+    }
+}
+
+#[test]
+fn test_screen_name_or_user_id() {
+    let v = ScreenNameOrUserId::ScreenName("tuna".to_string());
+    assert_eq!(v.to_string(), "screen_name");
+    assert_eq!(v.value(), "tuna");
 }
 
 impl Client {
@@ -88,58 +207,77 @@ impl Client {
         };
     }
 
-    pub fn get_follower_ids_by_id(self, id: &str) -> Result<Response<u64>, TwitterApiError> {
+    pub fn get_follower_ids_by_id(self, id: &str) -> Result<Response, TwitterApiError> {
         return self.get_follower_or_friends(
             RelationType::Followers,
-            ScreenNameOrUserId::UserId,
-            id,
+            ScreenNameOrUserId::UserId(id.to_string()),
+            None,
         );
     }
 
     pub fn get_follower_ids_by_screen_name(
         self,
         screen_name: &str,
-    ) -> Result<Response<u64>, TwitterApiError> {
+    ) -> Result<Response, TwitterApiError> {
         return self.get_follower_or_friends(
             RelationType::Followers,
-            ScreenNameOrUserId::ScreenName,
-            screen_name,
+            ScreenNameOrUserId::ScreenName(screen_name.to_string()),
+            None,
         );
     }
 
-    pub fn get_friends_ids_by_id(self, id: &str) -> Result<Response<u64>, TwitterApiError> {
-        return self.get_follower_or_friends(RelationType::Friends, ScreenNameOrUserId::UserId, id);
+    pub fn get_friends_ids_by_id(self, id: &str) -> Result<Response, TwitterApiError> {
+        return self.get_follower_or_friends(
+            RelationType::Friends,
+            ScreenNameOrUserId::UserId(id.to_string()),
+            None,
+        );
     }
 
     pub fn get_friends_ids_by_screen_name(
         self,
         screen_name: &str,
-    ) -> Result<Response<u64>, TwitterApiError> {
+    ) -> Result<Response, TwitterApiError> {
         return self.get_follower_or_friends(
             RelationType::Friends,
-            ScreenNameOrUserId::ScreenName,
-            screen_name,
+            ScreenNameOrUserId::ScreenName(screen_name.to_string()),
+            None,
         );
+    }
+
+    pub fn get_friends_ids_by_screen_name_iter(
+        self,
+        screen_name: &str,
+        waitRateLimit: bool,
+    ) -> ResponseIter {
+        let r = ResponseIter {
+            client: self,
+            cursor: "-1".to_string(),
+            by: ScreenNameOrUserId::ScreenName(screen_name.to_string()),
+            rel: RelationType::Friends,
+            wait_rate_limit: waitRateLimit,
+        };
+        return r;
     }
 
     fn get_follower_or_friends(
         mut self,
         rel: RelationType,
         by: ScreenNameOrUserId,
-        val: &str,
-    ) -> Result<Response<u64>, TwitterApiError> {
+        cursor: Option<String>,
+    ) -> Result<Response, TwitterApiError> {
+        let cursor_val = cursor.unwrap_or_else(|| "-1".to_string());
         let url = format!("{}/{}/ids.json", BASE_URL, rel);
         let res = self
             .agent
             .get(url.as_str())
             .set(
                 "Authorization",
-                self.generate_oauth_header("GET", url, vec![(by.to_string(), val.to_string())])
+                self.generate_oauth_header("GET", url, vec![by.clone().into()])
                     .as_str(),
             )
-            .query(by.to_string().as_str(), val)
+            .query(by.to_string().as_str(), by.value().as_str())
             .call()?;
-
         return Ok(res.into_json()?);
     }
 
@@ -210,9 +348,9 @@ impl Client {
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct Response<T> {
+pub struct Response {
     #[serde(rename = "ids")]
-    pub ids: Vec<T>,
+    pub ids: Vec<u64>,
 
     #[serde(rename = "next_cursor")]
     next_cursor: i64,
